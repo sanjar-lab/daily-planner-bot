@@ -60,6 +60,16 @@ def test_rank_models():
     assert ai._merge(["a", "b"], ["b", "c"]) == ["a", "b", "c"]
 
 
+def test_webhook_secret():
+    import re
+    for raw in ("abc_DEF-123", "a+b/c==", ""):
+        os.environ["WEBHOOK_SECRET"] = raw
+        s = config._webhook_secret()
+        assert re.fullmatch(r"[A-Za-z0-9_-]{1,256}", s), s
+    os.environ["WEBHOOK_SECRET"] = "abc_DEF-123"
+    assert config._webhook_secret() == "abc_DEF-123"
+
+
 def test_crypto():
     assert crypto.decrypt(crypto.encrypt("secret-key-123")) == "secret-key-123"
 

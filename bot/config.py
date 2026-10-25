@@ -1,4 +1,6 @@
+import hashlib
 import os
+import re
 
 from dotenv import load_dotenv
 
@@ -15,7 +17,16 @@ ENCRYPTION_KEY = os.environ.get("ENCRYPTION_KEY", "")
 
 # Webhook mode when a public URL is known (Render sets RENDER_EXTERNAL_URL itself).
 PUBLIC_URL = (os.getenv("PUBLIC_URL") or os.getenv("RENDER_EXTERNAL_URL") or "").rstrip("/")
-WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "")
+def _webhook_secret() -> str:
+    """Telegram allows only [A-Za-z0-9_-] in the secret; hash anything else (e.g. Render's
+    generated base64 values) into a safe token. Falls back to a token derived from BOT_TOKEN."""
+    raw = os.getenv("WEBHOOK_SECRET", "")
+    if re.fullmatch(r"[A-Za-z0-9_-]{1,256}", raw):
+        return raw
+    return hashlib.sha256((raw or BOT_TOKEN).encode()).hexdigest()
+
+
+WEBHOOK_SECRET = _webhook_secret()
 TICK_KEY = os.getenv("TICK_KEY", "")
 PORT = int(os.getenv("PORT", "8080"))
 MODE = os.getenv("MODE") or ("webhook" if PUBLIC_URL else "polling")
