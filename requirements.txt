@@ -1,0 +1,8 @@
+aiogram>=3.15,<4
+aiohttp>=3.9
+asyncpg>=0.29
+Pillow>=10.4
+cryptography>=43
+fonttools>=4.53
+python-dotenv>=1.0
+tzdata>=2024.1
