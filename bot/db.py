@@ -77,6 +77,11 @@ create table if not exists jobs (
 );
 create index if not exists jobs_due on jobs (run_at) where not done;
 
+-- v2: custom reminders / focus timers live in jobs without a plan; tasks remember if they were added later
+alter table jobs alter column plan_id drop not null;
+alter table jobs add column if not exists text text;
+alter table tasks add column if not exists added boolean not null default false;
+
 create table if not exists memory (
     user_id bigint not null references users(id) on delete cascade,
     key text not null,
@@ -189,19 +194,53 @@ async def publish_plan(plan_id: int, uid: int, plan_date: dt.date, tasks: list[d
             await conn.execute("delete from tasks where plan_id = any($1::bigint[])", [r["id"] for r in old])
         await conn.execute("update plans set status = 'posted', channel_msg_id = $2 where id = $1",
                            plan_id, channel_msg_id)
-        await conn.executemany(
-            "insert into tasks (plan_id, user_id, plan_date, idx, title, start_time, priority) "
-            "values ($1, $2, $3, $4, $5, $6, $7) on conflict do nothing",
-            [(plan_id, uid, plan_date, t["idx"], t["title"], t.get("start"), t.get("priority", "medium"))
-             for t in tasks])
+        await _sync_tasks(conn, plan_id, uid, plan_date, tasks)
         await conn.executemany(
             "insert into jobs (user_id, plan_id, kind, task_idx, run_at) values ($1, $2, $3, $4, $5)",
             [(uid, plan_id, kind, idx, run_at) for kind, idx, run_at in jobs])
         return [r["channel_msg_id"] for r in old if r["channel_msg_id"]]
 
 
+async def _sync_tasks(conn, plan_id, uid, plan_date, tasks):
+    """Make the tasks table match the plan, keeping done flags of tasks that stay (same idx)."""
+    await conn.execute("delete from tasks where plan_id = $1 and not (idx = any($2::int[]))",
+                       plan_id, [t["idx"] for t in tasks])
+    await conn.executemany(
+        "insert into tasks (plan_id, user_id, plan_date, idx, title, start_time, priority, added) "
+        "values ($1, $2, $3, $4, $5, $6, $7, $8) on conflict (plan_id, idx) do update set "
+        "title = excluded.title, start_time = excluded.start_time, priority = excluded.priority, "
+        "added = excluded.added, plan_date = excluded.plan_date",
+        [(plan_id, uid, plan_date, t["idx"], t["title"], t.get("start"), t.get("priority", "medium"),
+          bool(t.get("added"))) for t in tasks])
+
+
+async def update_posted(plan_id: int, uid: int, plan_date: dt.date, data: dict, jobs: list[tuple]):
+    """Change a plan that is already in the channel: data, tasks (done kept) and pending jobs."""
+    async with pool.acquire() as conn, conn.transaction():
+        await conn.execute("update plans set data = $2, plan_date = $3 where id = $1", plan_id, data, plan_date)
+        await _sync_tasks(conn, plan_id, uid, plan_date, data["tasks"])
+        await conn.execute("delete from jobs where plan_id = $1 and not done", plan_id)
+        await conn.executemany(
+            "insert into jobs (user_id, plan_id, kind, task_idx, run_at) values ($1, $2, $3, $4, $5)",
+            [(uid, plan_id, kind, idx, run_at) for kind, idx, run_at in jobs])
+
+
+async def plan_for(uid: int, plan_date: dt.date) -> asyncpg.Record | None:
+    """The posted plan for a date, else the newest draft for it."""
+    return await pool.fetchrow(
+        "select * from plans where user_id = $1 and plan_date = $2 and status in ('posted', 'draft') "
+        "order by (status = 'posted') desc, id desc limit 1", uid, plan_date)
+
+
 async def plan_tasks(plan_id: int) -> list[asyncpg.Record]:
-    return await pool.fetch("select * from tasks where plan_id = $1 order by idx", plan_id)
+    return await pool.fetch(
+        "select * from tasks where plan_id = $1 order by start_time nulls last, idx", plan_id)
+
+
+async def set_done(plan_id: int, idxs: list[int]) -> int:
+    return len(await pool.fetch(
+        "update tasks set done = true, done_at = now() where plan_id = $1 and idx = any($2::int[]) "
+        "and not done returning idx", plan_id, idxs))
 
 
 async def toggle_task(plan_id: int, idx: int) -> bool | None:
@@ -223,6 +262,23 @@ async def take_due_jobs(limit: int = 50) -> list[asyncpg.Record]:
         "update jobs set done = true where id in ("
         "  select id from jobs where not done and run_at <= now() order by run_at limit $1 "
         "  for update skip locked) returning *", limit)
+
+
+async def add_job(uid: int, kind: str, run_at: dt.datetime, text: str | None = None,
+                  plan_id: int | None = None, task_idx: int | None = None) -> int:
+    return await pool.fetchval(
+        "insert into jobs (user_id, plan_id, kind, task_idx, run_at, text) values ($1, $2, $3, $4, $5, $6) "
+        "returning id", uid, plan_id, kind, task_idx, run_at, text)
+
+
+async def pending_reminders(uid: int) -> list[asyncpg.Record]:
+    return await pool.fetch(
+        "select * from jobs where user_id = $1 and not done and kind in ('custom', 'focus') "
+        "order by run_at limit 30", uid)
+
+
+async def delete_job(uid: int, job_id: int):
+    await pool.execute("delete from jobs where id = $1 and user_id = $2", job_id, uid)
 
 
 # ---- memory ----------------------------------------------------------------

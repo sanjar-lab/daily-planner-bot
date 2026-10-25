@@ -345,3 +345,26 @@ def t(lang: str | None, key: str, **kw) -> str:
     entry = T[key]
     s = entry.get(lang or "uz") or entry["en"]
     return s.format(**kw) if kw else s
+
+
+# extra strings and the persistent menu live in i18n_extra.py
+from .i18n_extra import EXTRA, MENU  # noqa: E402
+
+T.update(EXTRA)
+
+
+def menu_label(lang: str | None, key: str) -> str:
+    for row in MENU:
+        for k, labels in row:
+            if k == key:
+                return labels.get(lang or "uz", labels["en"])
+    raise KeyError(key)
+
+
+def menu_action(text: str | None) -> str | None:
+    """Which menu button a text came from (any language)."""
+    for row in MENU:
+        for k, labels in row:
+            if text in labels.values():
+                return k
+    return None

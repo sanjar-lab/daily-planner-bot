@@ -50,6 +50,7 @@ def normalize(plan: dict, default_date: dt.date) -> dict:
         start, end = to_min(t.get("start")), to_min(t.get("end"))
         pr = str(t.get("priority") or "medium").lower()
         tasks.append({
+            "added": bool(t.get("added")),
             "title": title[:90],
             "start": hhmm(start) if start is not None else None,
             "end": hhmm(end) if end is not None and start is not None else None,
@@ -127,3 +128,79 @@ def schedule(user, plan: dict) -> list[tuple]:
         if user["task_cards"] and start > now - dt.timedelta(minutes=2):
             jobs.append(("task_card", t["idx"], start))
     return jobs
+
+
+# ---- chat routing & changes to existing plans ----------------------------------
+def plan_lines(plan: dict | None, done: dict[int, bool] | None = None) -> str:
+    if not plan:
+        return ""
+    done = done or {}
+    return "\n".join(f"{t['idx']}: {t.get('start') or '--:--'} {t['title']}{' [done]' if done.get(t['idx']) else ''}"
+                     for t in plan["tasks"])
+
+
+async def route(user, text: str, today_plan, today_done, tomorrow_plan) -> dict:
+    now = local_now(user)
+    system = prompts.router_system(
+        user["lang"], now.strftime("%Y-%m-%d %H:%M (%A)"), plan_lines(today_plan, today_done),
+        plan_lines(tomorrow_plan), await memory_text(user["id"]))
+    raw = await ai_for(user).json(system, text, tier="light")
+    intent = str(raw.get("intent") or "chat").lower()
+    raw["intent"] = intent if intent in ("plan", "add", "edit", "done", "remind", "habit", "goal", "chat") else "chat"
+    return raw
+
+
+def merge_added(plan: dict, new_tasks: list[dict]) -> dict:
+    """Append new tasks with fresh ids and the 'added' flag, keeping existing ids stable."""
+    base = normalize({"date": plan["date"], "tasks": new_tasks}, dt.date.fromisoformat(plan["date"]))["tasks"]
+    nxt = max((t["idx"] for t in plan["tasks"]), default=-1) + 1
+    old_titles = {t["title"].strip().lower() for t in plan["tasks"]}
+    tasks = list(plan["tasks"])
+    for t in base:
+        if t["title"].strip().lower() in old_titles:
+            continue
+        tasks.append(dict(t, idx=nxt, added=True))
+        nxt += 1
+    return dict(plan, tasks=_sorted(tasks))
+
+
+def reconcile(old: dict, new: dict) -> dict:
+    """After an AI edit, give tasks that still exist their old ids (so ticks survive)."""
+    by_title = {t["title"].strip().lower(): t for t in old["tasks"]}
+    nxt = max((t["idx"] for t in old["tasks"]), default=-1) + 1
+    tasks = []
+    for t in new["tasks"]:
+        prev = by_title.pop(t["title"].strip().lower(), None)
+        if prev:
+            tasks.append(dict(t, idx=prev["idx"], added=prev.get("added", False)))
+        else:
+            tasks.append(dict(t, idx=nxt, added=old.get("_posted", False)))
+            nxt += 1
+    return dict(new, tasks=_sorted(tasks))
+
+
+def _sorted(tasks: list[dict]) -> list[dict]:
+    timed = sorted((t for t in tasks if t.get("start")), key=lambda t: t["start"])
+    return timed + [t for t in tasks if not t.get("start")]
+
+
+async def add_to_plan(user, plan: dict, text: str) -> dict:
+    import json
+
+    raw = await ai_for(user).json(
+        prompts.add_system(user["lang"]),
+        f"Existing plan JSON:\n{json.dumps(plan, ensure_ascii=False)}\n\nUser message:\n{text}", tier="smart")
+    return merge_added(plan, [t for t in raw.get("tasks") or [] if isinstance(t, dict)])
+
+
+def local_to_utc(user, value: str) -> dt.datetime | None:
+    try:
+        naive = dt.datetime.strptime(value.strip()[:16], "%Y-%m-%d %H:%M")
+    except (ValueError, AttributeError):
+        return None
+    return naive.replace(tzinfo=tzinfo(user)).astimezone(dt.timezone.utc)
+
+
+def with_done(plan: dict, tasks) -> dict:
+    done = {r["idx"]: r["done"] for r in tasks}
+    return dict(plan, tasks=[dict(t, done=done.get(t["idx"], False)) for t in plan["tasks"]])

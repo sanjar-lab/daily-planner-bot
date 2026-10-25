@@ -20,9 +20,9 @@ from aiogram.types import (
 
 from . import db, planner, reports
 from .ai import AIError, validate_key
-from .channel import caption, checklist, post_plan, user_theme
+from .channel import caption, checklist, post_plan, refresh_post, user_theme
 from .crypto import decrypt, encrypt, mask
-from .i18n import LANGS, t
+from .i18n import LANGS, MENU, menu_action, t
 from .render import N_THEMES, render_day
 from .render.labels import date_long
 from .render.sample import SAMPLE
@@ -139,7 +139,7 @@ async def cmd_start(msg: Message):
                          reply_markup=kb([(v, f"lang:{k}") for k, v in LANGS.items()]))
         return
     if await next_step(msg, user):
-        await msg.answer(t(user["lang"], "ready"))
+        await show_menu(msg, user, t(user["lang"], "ready"))
 
 
 @router.callback_query(F.data.startswith("lang:"))
@@ -176,7 +176,7 @@ async def cb_skip(cq: CallbackQuery):
         await db.set_state(user["id"], None)
     user = await db.get_user(user["id"])
     if await next_step(cq.message, user):
-        await cq.message.answer(t(user["lang"], "ready"))
+        await show_menu(cq.message, user, t(user["lang"], "ready"))
 
 
 @router.callback_query(F.data.startswith("kh:"))
@@ -285,6 +285,7 @@ async def connect_channel(msg: Message, bot: Bot, user, chat_id: int):
         await next_step(msg, await db.get_user(user["id"]))
     else:
         await db.set_state(user["id"], None)
+        await show_menu(msg, user)
 
 
 # ---------------------------------------------------------------------------
@@ -331,6 +332,19 @@ async def send_preview(msg: Message, user, plan_id: int, plan: dict, theme: int,
                            reply_markup=preview_kb(user, plan_id))
 
 
+def main_menu(lang: str) -> ReplyKeyboardMarkup:
+    return ReplyKeyboardMarkup(
+        keyboard=[[KeyboardButton(text=labels.get(lang, labels["en"])) for _, labels in row] for row in MENU],
+        resize_keyboard=True, is_persistent=True, input_field_placeholder="✍️ 🎙")
+
+
+async def show_menu(msg: Message, user, text: str | None = None):
+    await msg.answer(text or t(user["lang"], "menu_hint"), reply_markup=main_menu(user["lang"]))
+
+
+ONBOARDING = ("ask_gemini", "ask_groq", "ask_tz", "ask_channel")
+
+
 @router.message(F.text & ~F.text.startswith("/") | F.voice | F.audio | F.video_note)
 async def on_plan_input(msg: Message, bot: Bot):
     user = await db.get_user(msg.from_user.id)
@@ -363,6 +377,13 @@ async def on_plan_input(msg: Message, bot: Bot):
         await msg.answer(t(lang, "need_setup"))
         return await next_step(msg, user)
 
+    action = menu_action(msg.text)
+    if action:
+        if state and state not in ONBOARDING:
+            await db.set_state(user["id"], None)
+            user = await db.get_user(user["id"])
+        return await on_menu(msg, bot, user, action)
+
     lock = _locks.setdefault(user["id"], asyncio.Lock())
     if lock.locked():
         return await msg.answer(t(lang, "busy"))
@@ -373,8 +394,85 @@ async def on_plan_input(msg: Message, bot: Bot):
         if state == "ask_about" or state == "remember":
             return await learn(msg, user, text)
         if state.startswith("edit:"):
-            return await apply_edit(msg, user, int(state.split(":")[1]), text)
-        await create_plan(msg, user, text)
+            return await apply_edit(msg, bot, user, int(state.split(":")[1]), text)
+        await smart_input(msg, bot, user, text)
+
+
+# ---------------------------------------------------------------------------
+# Chat mode: every free message is routed by the AI
+# ---------------------------------------------------------------------------
+async def _day_context(user):
+    today = planner.local_now(user).date()
+    t_row = await db.plan_for(user["id"], today)
+    m_row = await db.plan_for(user["id"], today + dt.timedelta(days=1))
+    t_done = {r["idx"]: r["done"] for r in await db.plan_tasks(t_row["id"])} if t_row else {}
+    return today, t_row, t_done, m_row
+
+
+async def smart_input(msg: Message, bot: Bot, user, text: str):
+    lang = user["lang"]
+    status = await msg.answer(t(lang, "thinking"))
+    today, t_row, t_done, m_row = await _day_context(user)
+    try:
+        r = await planner.route(user, text, t_row["data"] if t_row else None, t_done,
+                                m_row["data"] if m_row else None)
+    except AIError as e:
+        return await status.edit_text(t(lang, f"err_{e.reason}"))
+    intent = r["intent"]
+    reply = html.escape(str(r.get("reply") or ""))[:900]
+    try:
+        day = dt.date.fromisoformat(str(r.get("date"))[:10])
+    except ValueError:
+        day = None
+    log.info("route %s → %s (%s)", user["id"], intent, day)
+
+    if intent in ("plan", "add", "edit"):
+        target = day or (today + dt.timedelta(days=1))
+        row = t_row if target == today else m_row if target == today + dt.timedelta(days=1) else \
+            await db.plan_for(user["id"], target)
+        if not row:
+            await safe_delete(status)
+            return await create_plan(msg, user, text)
+        if intent == "plan":
+            await db.set_state(user["id"], user["state"], dict(user["state_data"] or {}, pending=text))
+            await safe_delete(status)
+            return await msg.answer(t(lang, "plan_exists", date=date_long(lang, row["plan_date"])), reply_markup=kb(
+                [(t(lang, "btn_add"), f"pa:add:{row['id']}")], [(t(lang, "btn_replace"), "pa:replace:0")]))
+        await safe_delete(status)
+        if intent == "add":
+            return await apply_add(msg, bot, user, row, text)
+        return await apply_edit(msg, bot, user, row["id"], text)
+
+    if intent == "done":
+        ids = [int(i) for i in r.get("task_ids") or [] if str(i).lstrip("-").isdigit()]
+        target = day or today
+        row = t_row if target == today else m_row if target == today + dt.timedelta(days=1) else \
+            await db.plan_for(user["id"], target)
+        row = row if row and row["status"] == "posted" else None
+        if not row or not ids:
+            return await status.edit_text(t(lang, "done_none"))
+        await db.set_done(row["id"], ids)
+        titles = [tk["title"] for tk in row["data"]["tasks"] if tk["idx"] in ids]
+        await refresh_post(bot, user, row["id"])
+        return await status.edit_text(t(lang, "done_ok", items=html.escape(", ".join(titles))))
+
+    if intent == "remind":
+        at = planner.local_to_utc(user, str(r.get("remind_at") or ""))
+        rtext = str(r.get("remind_text") or text)[:300]
+        if not at or at < dt.datetime.now(dt.timezone.utc):
+            return await status.edit_text(t(lang, "remind_bad"))
+        await db.add_job(user["id"], "custom", at, rtext)
+        when = at.astimezone(planner.tzinfo(user))
+        return await status.edit_text(t(lang, "remind_ok", when=f"{date_long(lang, when.date())} {when:%H:%M}",
+                                        text=html.escape(rtext)))
+
+    if intent in ("habit", "goal") and isinstance(r.get("memory"), dict) and r["memory"].get("value"):
+        mem = dict(r["memory"], category=intent)
+        mem["key"] = mem.get("key") or f"{intent}_{int(dt.datetime.now().timestamp())}"
+        await db.save_memory(user["id"], [mem], [])
+        return await status.edit_text(t(lang, f"{intent}_ok", v=html.escape(str(mem["value"]))))
+
+    await status.edit_text(reply or t(lang, "menu_hint"))
 
 
 async def create_plan(msg: Message, user, text: str):
@@ -394,11 +492,42 @@ async def create_plan(msg: Message, user, text: str):
     await safe_delete(status)
 
 
-async def apply_edit(msg: Message, user, plan_id: int, instruction: str):
+async def save_change(msg: Message, bot: Bot, user, row, plan: dict, ok_text: str):
+    """Persist a changed plan: drafts get a new preview, posted plans update the channel in place."""
+    date = dt.date.fromisoformat(plan["date"])
+    if row["status"] == "draft":
+        await db.update_plan(row["id"], data=plan, plan_date=date)
+        return await send_preview(msg, user, row["id"], plan, row["theme"])
+    done = {r["idx"]: r["done"] for r in await db.plan_tasks(row["id"])}
+    jobs = [j for j in planner.schedule(user, plan) if not done.get(j[1])]
+    await db.update_posted(row["id"], user["id"], date, plan, jobs)
+    img = await refresh_post(bot, user, row["id"])
+    tasks = await db.plan_tasks(row["id"])
+    if img:
+        await msg.answer_photo(BufferedInputFile(img, "plan.jpg"), caption=ok_text,
+                               reply_markup=checklist(row["id"], tasks))
+
+
+async def apply_add(msg: Message, bot: Bot, user, row, text: str):
+    lang = user["lang"]
+    status = await msg.answer(t(lang, "thinking"))
+    try:
+        plan = await planner.add_to_plan(user, row["data"], text)
+    except AIError as e:
+        return await status.edit_text(t(lang, f"err_{e.reason}"))
+    n = len(plan["tasks"]) - len(row["data"]["tasks"])
+    if n <= 0:
+        return await status.edit_text(t(lang, "nothing_added"))
+    await safe_delete(status)
+    await save_change(msg, bot, user, row, plan,
+                      t(lang, "added_ok" if row["status"] == "posted" else "added_draft", n=n))
+
+
+async def apply_edit(msg: Message, bot: Bot, user, plan_id: int, instruction: str):
     lang = user["lang"]
     row = await db.get_plan(plan_id)
     await db.set_state(user["id"], None)
-    if not row or row["user_id"] != user["id"]:
+    if not row or row["user_id"] != user["id"] or row["status"] not in ("draft", "posted"):
         return await msg.answer(t(lang, "expired"))
     status = await msg.answer(t(lang, "thinking"))
     try:
@@ -407,14 +536,27 @@ async def apply_edit(msg: Message, user, plan_id: int, instruction: str):
         return await status.edit_text(t(lang, f"err_{e.reason}"))
     if not plan["tasks"]:
         return await status.edit_text(t(lang, "no_tasks"))
-    # an edited posted plan becomes a fresh draft that replaces it when posted
-    new_id = plan_id
-    if row["status"] != "draft":
-        new_id = await db.create_draft(user["id"], dt.date.fromisoformat(plan["date"]), plan, row["theme"])
-    else:
-        await db.update_plan(plan_id, data=plan, plan_date=dt.date.fromisoformat(plan["date"]))
-    await send_preview(msg, user, new_id, plan, row["theme"])
+    plan = planner.reconcile(dict(row["data"], _posted=row["status"] == "posted"), plan)
     await safe_delete(status)
+    await save_change(msg, bot, user, row, plan, t(lang, "edited_ok"))
+
+
+@router.callback_query(F.data.startswith("pa:"))
+async def cb_pending(cq: CallbackQuery, bot: Bot):
+    _, action, pid = cq.data.split(":")
+    user = await db.get_user(cq.from_user.id)
+    data = dict(user["state_data"] or {})
+    text = data.pop("pending", None)
+    await db.set_state(user["id"], user["state"], data)
+    await cq.answer()
+    await cq.message.edit_reply_markup(reply_markup=None)
+    if not text:
+        return await cq.message.answer(t(user["lang"], "expired"))
+    if action == "replace":
+        return await create_plan(cq.message, user, text)
+    row = await db.get_plan(int(pid))
+    if row:
+        await apply_add(cq.message, bot, user, row, text)
 
 
 async def learn(msg: Message, user, text: str):
@@ -436,7 +578,7 @@ async def learn(msg: Message, user, text: str):
     else:
         await msg.answer(t(lang, "nothing_learned"))
     if onboarding:
-        await msg.answer(t(lang, "ready"))
+        await show_menu(msg, user, t(lang, "ready"))
 
 
 @router.callback_query(F.data.startswith("p:"))
@@ -484,7 +626,7 @@ async def cb_preview(cq: CallbackQuery, bot: Bot):
         if data.pop("carry", None) is not None:
             await db.set_state(user["id"], user["state"], data)
         await cq.message.edit_reply_markup(reply_markup=None)
-        await cq.message.answer(t(lang, "posted", jobs=len(jobs)))
+        await cq.message.answer(t(lang, "posted", jobs=len(jobs)), reply_markup=main_menu(lang))
 
 
 # ---------------------------------------------------------------------------
@@ -518,6 +660,24 @@ async def cb_tick(cq: CallbackQuery, bot: Bot):
                     show_alert=bool(all_done and done))
 
 
+@router.callback_query(F.data.startswith("rk:") | F.data.startswith("sn:"))
+async def cb_reminder_action(cq: CallbackQuery, bot: Bot):
+    """Buttons under a task reminder: mark done, or snooze 15 minutes."""
+    kind, pid, idx = cq.data.split(":")
+    user = await db.get_user(cq.from_user.id)
+    row = await db.get_plan(int(pid))
+    if not row or row["user_id"] != user["id"]:
+        return await cq.answer()
+    await cq.message.edit_reply_markup(reply_markup=None)
+    if kind == "rk":
+        await db.set_done(row["id"], [int(idx)])
+        await refresh_post(bot, user, row["id"])
+        return await cq.answer(t(user["lang"], "ticked"))
+    title = next((tk["title"] for tk in row["data"]["tasks"] if tk["idx"] == int(idx)), "")
+    await db.add_job(user["id"], "custom", dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=15), title)
+    await cq.answer(t(user["lang"], "snoozed"))
+
+
 @router.callback_query(F.data == "carry")
 async def cb_carry(cq: CallbackQuery):
     user = await db.get_user(cq.from_user.id)
@@ -531,21 +691,151 @@ async def cb_carry(cq: CallbackQuery):
     await cq.message.answer(t(user["lang"], "carry_ok", n=len(left)))
 
 
+@router.callback_query(F.data == "repeat")
+async def cb_repeat(cq: CallbackQuery):
+    """Copy today's plan to tomorrow as a fresh draft."""
+    user = await db.get_user(cq.from_user.id)
+    await cq.answer()
+    today = planner.local_now(user).date()
+    row = await db.plan_for(user["id"], today)
+    if not row:
+        return await cq.message.answer(t(user["lang"], "no_today_plan"))
+    tomorrow = today + dt.timedelta(days=1)
+    tasks = [{k: v for k, v in tk.items() if k not in ("added", "done")} for tk in row["data"]["tasks"]]
+    plan = planner.normalize(dict(row["data"], date=tomorrow.isoformat(), tasks=tasks), tomorrow)
+    theme = user_theme(user, tomorrow)
+    pid = await db.create_draft(user["id"], tomorrow, plan, theme)
+    await cq.message.answer(t(user["lang"], "repeat_ok"))
+    await send_preview(cq.message, user, pid, plan, theme)
+
+
+async def show_plan(msg: Message, user, row):
+    """A plan in DM: posted plans with their checklist, drafts with the preview buttons."""
+    if row["status"] == "draft":
+        return await send_preview(msg, user, row["id"], row["data"], row["theme"])
+    tasks = await db.plan_tasks(row["id"])
+    view = planner.with_done(row["data"], tasks)
+    img = await asyncio.to_thread(render_day, view, user["lang"], row["theme"])
+    await msg.answer_photo(BufferedInputFile(img, "plan.jpg"), caption=caption(row["data"], tasks, user["lang"]),
+                           reply_markup=checklist(row["id"], tasks))
+
+
 @router.message(Command("today"))
 async def cmd_today(msg: Message):
     user = await db.get_user(msg.from_user.id)
     if not user:
         return await cmd_start(msg)
-    row = await db.posted_plan(user["id"], planner.local_now(user).date())
+    row = await db.plan_for(user["id"], planner.local_now(user).date())
     if not row:
         return await msg.answer(t(user["lang"], "today_none"))
-    tasks = await db.plan_tasks(row["id"])
-    plan = dict(row["data"])
-    done = {tk["idx"]: tk["done"] for tk in tasks}
-    plan["tasks"] = [dict(tk, done=done.get(tk["idx"], False)) for tk in plan["tasks"]]
-    img = await asyncio.to_thread(render_day, plan, user["lang"], row["theme"])
-    await msg.answer_photo(BufferedInputFile(img, "today.jpg"), caption=caption(plan, tasks, user["lang"]),
-                           reply_markup=checklist(row["id"], tasks))
+    await show_plan(msg, user, row)
+
+
+# ---------------------------------------------------------------------------
+# Menu: tomorrow, reminders, focus, goals
+# ---------------------------------------------------------------------------
+def plan_start_kb(lang: str) -> InlineKeyboardMarkup:
+    return kb([(t(lang, "btn_repeat"), "repeat")], [(t(lang, "btn_carry2"), "carry")])
+
+
+async def on_menu(msg: Message, bot: Bot, user, action: str):
+    lang = user["lang"]
+    if action == "m_plan":
+        return await msg.answer(t(lang, "plan_prompt"), reply_markup=plan_start_kb(lang))
+    if action == "m_today":
+        return await cmd_today(msg)
+    if action == "m_tomorrow":
+        row = await db.plan_for(user["id"], planner.local_now(user).date() + dt.timedelta(days=1))
+        if not row:
+            return await msg.answer(t(lang, "tomorrow_none"), reply_markup=plan_start_kb(lang))
+        return await show_plan(msg, user, row)
+    if action == "m_remind":
+        text, markup = await reminders_view(user)
+        return await msg.answer(text, reply_markup=markup)
+    if action == "m_focus":
+        return await msg.answer(t(lang, "focus_pick"), reply_markup=kb(
+            [("25", "fo:25"), ("50", "fo:50"), ("90", "fo:90")]))
+    if action == "m_report":
+        return await cmd_report(msg)
+    if action == "m_goals":
+        text, markup = await goals_view(user)
+        return await msg.answer(text, reply_markup=markup)
+    if action == "m_settings":
+        return await show_settings(msg, user)
+
+
+async def reminders_view(user):
+    lang = user["lang"]
+    tz = planner.tzinfo(user)
+    lines = [t(lang, "reminders_title"), ""]
+    lines.append(t(lang, "reminders_auto", m=user["remind_before"]) if user["reminders"] else "🔕")
+    rows = []
+    jobs = await db.pending_reminders(user["id"])
+    if not jobs:
+        lines.append("\n" + t(lang, "reminders_empty"))
+    for i, j in enumerate(jobs):
+        when = j["run_at"].astimezone(tz)
+        icon, label = ("🍅", f"{j['text']} min") if j["kind"] == "focus" else ("⏰", j["text"] or "")
+        lines.append(f"{i + 1}. {icon} <b>{date_long(lang, when.date())} {when:%H:%M}</b> — {html.escape(label)}")
+        rows.append((f"🗑 {i + 1}", f"rd:{j['id']}"))
+    return "\n".join(lines)[:4000], kb(*[rows[i:i + 5] for i in range(0, len(rows), 5)]) if rows else None
+
+
+@router.callback_query(F.data.startswith("rd:"))
+async def cb_reminder_delete(cq: CallbackQuery):
+    user = await db.get_user(cq.from_user.id)
+    await db.delete_job(user["id"], int(cq.data.split(":")[1]))
+    await cq.answer(t(user["lang"], "reminder_deleted"))
+    text, markup = await reminders_view(user)
+    await cq.message.edit_text(text, reply_markup=markup)
+
+
+@router.callback_query(F.data.startswith("fo:"))
+async def cb_focus(cq: CallbackQuery):
+    user = await db.get_user(cq.from_user.id)
+    minutes = int(cq.data.split(":")[1])
+    end = dt.datetime.now(dt.timezone.utc) + dt.timedelta(minutes=minutes)
+    job_id = await db.add_job(user["id"], "focus", end, str(minutes))
+    await cq.answer()
+    local_end = end.astimezone(planner.tzinfo(user))
+    await cq.message.answer(t(user["lang"], "focus_started", m=minutes, end=f"{local_end:%H:%M}"),
+                            reply_markup=kb([(t(user["lang"], "btn_cancel_focus"), f"fs:{job_id}")]))
+
+
+@router.callback_query(F.data.startswith("fs:"))
+async def cb_focus_stop(cq: CallbackQuery):
+    user = await db.get_user(cq.from_user.id)
+    await db.delete_job(user["id"], int(cq.data.split(":")[1]))
+    await cq.answer(t(user["lang"], "cancelled"))
+    await cq.message.edit_reply_markup(reply_markup=None)
+
+
+async def goals_view(user):
+    lang = user["lang"]
+    rows = await db.get_memory(user["id"])
+    goals = [r for r in rows if r["category"] == "goal"]
+    habits = [r for r in rows if r["category"] == "habit"]
+    if not goals and not habits:
+        return f"{t(lang, 'goals_title')}\n\n{t(lang, 'goals_empty')}", None
+    lines, buttons, n = [], [], 0
+    for title, items, icon in ((t(lang, "goals_title"), goals, "🎯"), (t(lang, "habits_title"), habits, "🔁")):
+        if not items:
+            continue
+        lines += ["", title]
+        for r in items:
+            n += 1
+            lines.append(f"{n}. {html.escape(r['value'])}")
+            buttons.append((f"🗑 {icon}{n}", f"gd:{r['key'][:50]}"))
+    return "\n".join(lines).strip()[:4000], kb(*[buttons[i:i + 4] for i in range(0, len(buttons), 4)])
+
+
+@router.callback_query(F.data.startswith("gd:"))
+async def cb_goal_delete(cq: CallbackQuery):
+    user = await db.get_user(cq.from_user.id)
+    await db.delete_memory(user["id"], cq.data.split(":", 1)[1])
+    await cq.answer(t(user["lang"], "memory_deleted"))
+    text, markup = await goals_view(user)
+    await cq.message.edit_text(text, reply_markup=markup)
 
 
 # ---------------------------------------------------------------------------
@@ -811,6 +1101,8 @@ async def cmd_templates(msg: Message):
 @router.message(Command("help"))
 async def cmd_help(msg: Message):
     user = await db.get_user(msg.from_user.id)
+    if user and user["channel_id"]:
+        return await show_menu(msg, user, t(user["lang"], "help"))
     await msg.answer(t(user["lang"] if user else "uz", "help"))
 
 
@@ -819,4 +1111,6 @@ async def cmd_cancel(msg: Message):
     user = await db.get_user(msg.from_user.id)
     if user:
         await db.set_state(user["id"], None)
+        if user["channel_id"]:
+            return await show_menu(msg, user, t(user["lang"], "cancelled"))
         await msg.answer(t(user["lang"], "cancelled"), reply_markup=ReplyKeyboardRemove())

@@ -62,6 +62,17 @@ def _short_time(m: int | None) -> str:
     return s[1:] if s.startswith("0") else s
 
 
+def _note(t, lang: str, d: int) -> str:
+    """Row note; tasks added to an existing plan always show a '+ Added' marker."""
+    if t.added:
+        return f"+ {w(lang, 'added')}" + (f" · {t.note}" if t.note else "")
+    return t.note if d < 3 else ""
+
+
+def _nc(t, normal, added):
+    return added if t.added else normal
+
+
 # ---------------------------------------------------------------------------
 # 1. Editorial — warm paper, big serif date, numbered rows with hairlines
 # ---------------------------------------------------------------------------
@@ -120,7 +131,7 @@ def editorial(c, day: Day, lang: str) -> float:
     tw = W - M - 56 - tx
     for i, t in enumerate(day.tasks):
         tl = wrap(t.title, tf, tw, 3 if d < 2 else 2)
-        nl = wrap(t.note, nf, tw, 2 if d < 2 else 1) if t.note and d < 3 else []
+        nl = wrap(_note(t, lang, d), nf, tw, 2 if d < 2 else 1) if _note(t, lang, d) else []
         tlh, nlh = tf.size * 1.24, nf.size * 1.38
         body = len(tl) * tlh + (len(nl) * nlh + 4 if nl else 0)
         left = timef.size * 1.3 + (endf.size * 1.3 if t.end is not None else 0)
@@ -135,7 +146,7 @@ def editorial(c, day: Day, lang: str) -> float:
             c.text(M + 54, ry, "—", timef, P.muted)
         c.lines(tx, ry - 3, tl, tf, P.ink, tlh)
         if nl:
-            c.lines(tx, ry - 3 + len(tl) * tlh + 4, nl, nf, P.muted, nlh)
+            c.lines(tx, ry - 3 + len(tl) * tlh + 4, nl, nf, _nc(t, P.muted, P.accent), nlh)
         mx, my = W - M - 12, ry + tf.size * 0.55
         if t.priority == "high":
             c.circle(mx, my, 11, P.accent)
@@ -222,7 +233,7 @@ def timeline(c, day: Day, lang: str) -> float:
         pill = duration(lang, t.minutes)
         pw = text_w(pill, F("Manrope", 18, 800)) + 28 if pill else 0
         tl = wrap(t.title, tf, cw - 2 * pad - (0 if show_lab else pw + 14), 3 if d < 2 else 2)
-        nl = wrap(t.note, nf, cw - 2 * pad, 2 if d < 2 else 1) if t.note and d < 3 else []
+        nl = wrap(_note(t, lang, d), nf, cw - 2 * pad, 2 if d < 2 else 1) if _note(t, lang, d) else []
         tlh, nlh = tf.size * 1.25, nf.size * 1.38
         h = 2 * pad + (30 if show_lab else 0) + len(tl) * tlh + (len(nl) * nlh + 6 if nl else 0)
         dot_y = y + pad + 12
@@ -252,7 +263,7 @@ def timeline(c, day: Day, lang: str) -> float:
             c.text(px + pw / 2, y + pad + 10, pill, F("Manrope", 18, 800), fg, anchor="mm")
         c.lines(cardx + pad, iy - 2, tl, tf, fg, tlh)
         if nl:
-            c.lines(cardx + pad, iy - 2 + len(tl) * tlh + 6, nl, nf, sub, nlh)
+            c.lines(cardx + pad, iy - 2 + len(tl) * tlh + 6, nl, nf, _nc(t, sub, "#8FD3AE" if dark else P.accent), nlh)
         y += h + gap
     for dot_y, pr in dots:
         if pr == "high":
@@ -332,7 +343,7 @@ def bento(c, day: Day, lang: str) -> float:
 
         def tile_h(t, width):
             tl = wrap(t.title, tf, width - 2 * pad, 4)
-            nl = wrap(t.note, nf, width - 2 * pad, 3) if t.note else []
+            nl = wrap(_note(t, lang, 0), nf, width - 2 * pad, 3) if _note(t, lang, 0) else []
             return tl, nl, pad + 40 + 20 + len(tl) * tf.size * 1.22 + (
                 len(nl) * nf.size * 1.4 + 10 if nl else 0) + 22 + 26 + pad
 
@@ -355,7 +366,8 @@ def bento(c, day: Day, lang: str) -> float:
                 ty = y + pad + 40 + 20
                 c.lines(x + pad, ty, tl, tf, fg, tf.size * 1.22)
                 if nl:
-                    c.lines(x + pad, ty + len(tl) * tf.size * 1.22 + 10, nl, nf, sub, nf.size * 1.4)
+                    c.lines(x + pad, ty + len(tl) * tf.size * 1.22 + 10, nl, nf,
+                            _nc(t, sub, "#1C0F0A" if t.priority == "high" else "#5B3FE0"), nf.size * 1.4)
                 c.text(x + pad, y + rh - pad - 18, category(lang, t.category).upper(), lf, sub,
                        tracking=2.5, anchor="ls")
                 dur = duration(lang, t.minutes)
@@ -368,7 +380,7 @@ def bento(c, day: Day, lang: str) -> float:
         tf = F("Inter", _pick(d, 28, 28, 27, 25), 650)
         rh = _pick(d, 70, 70, 64, 56)
         for t in day.tasks:
-            rows.append(wrap(t.title, tf, W - 2 * M - 300, 1))
+            rows.append(wrap(("+ " if t.added else "") + t.title, tf, W - 2 * M - 300, 1))
         lh = 36 + len(rows) * rh + 20
         c.rect(M, y, W - 2 * M, lh, R, P.card)
         ry = y + 28
@@ -443,7 +455,7 @@ def swiss(c, day: Day, lang: str) -> float:
     tw = W - M - 90 - tx
     for i, t in enumerate(day.tasks):
         tl = wrap(t.title, tf, tw, 3 if d < 2 else 2)
-        nl = wrap(t.note, nf, tw, 2 if d < 2 else 1) if t.note and d < 3 else []
+        nl = wrap(_note(t, lang, d), nf, tw, 2 if d < 2 else 1) if _note(t, lang, d) else []
         tlh, nlh = tf.size * 1.24, nf.size * 1.38
         body = len(tl) * tlh + (len(nl) * nlh + 4 if nl else 0)
         left = stf.size * 1.35 + (etf.size * 1.3 if t.end is not None else 0)
@@ -455,7 +467,7 @@ def swiss(c, day: Day, lang: str) -> float:
             c.text(M, ry + stf.size * 1.35, hhmm(t.end), etf, P.muted)
         c.lines(tx, ry - 2, tl, tf, P.ink, tlh)
         if nl:
-            c.lines(tx, ry - 2 + len(tl) * tlh + 4, nl, nf, P.muted, nlh)
+            c.lines(tx, ry - 2 + len(tl) * tlh + 4, nl, nf, _nc(t, P.muted, P.accent), nlh)
         filled = {"high": 3, "medium": 2, "low": 1}[t.priority]
         for b in range(3):
             bx = W - M - 8 - (2 - b) * 15
@@ -529,7 +541,7 @@ def soft(c, day: Day, lang: str) -> float:
         for t in tasks:
             tag = t.priority == "high"
             tl = wrap(t.title, tf, tw - (120 if tag else 0), 3 if d < 2 else 2)
-            nl = wrap(t.note, nf, tw, 2 if d < 2 else 1) if t.note and d < 3 else []
+            nl = wrap(_note(t, lang, d), nf, tw, 2 if d < 2 else 1) if _note(t, lang, d) else []
             body = len(tl) * tf.size * 1.25 + (len(nl) * nf.size * 1.38 + 4 if nl else 0)
             laid.append((t, tl, nl, max(body, 64 if t.end is not None else 40) + 2 * pad))
         ch = sum(h for *_, h in laid) + 16
@@ -544,7 +556,7 @@ def soft(c, day: Day, lang: str) -> float:
                 c.text(M + 80, iy + 62, hhmm(t.end), F("Manrope", 19, 700), P.muted, anchor="mm")
             c.lines(rx, iy - 2, tl, tf, P.ink, tf.size * 1.25)
             if nl:
-                c.lines(rx, iy - 2 + len(tl) * tf.size * 1.25 + 4, nl, nf, P.muted, nf.size * 1.38)
+                c.lines(rx, iy - 2 + len(tl) * tf.size * 1.25 + 4, nl, nf, _nc(t, P.muted, P.accent), nf.size * 1.38)
             if t.priority == "high":
                 tag = w(lang, "high")
                 tgw = text_w(tag, F("Manrope", 17, 800)) + 26
@@ -597,7 +609,7 @@ def notebook(c, day: Day, lang: str) -> float:
     tw = R - tx - 170
     for t in day.tasks:
         tl = wrap(t.title, tf, tw, 3 if d < 2 else 2)
-        nl = wrap(t.note, nf, tw, 2 if d < 2 else 1) if t.note and d < 3 else []
+        nl = wrap(_note(t, lang, d), nf, tw, 2 if d < 2 else 1) if _note(t, lang, d) else []
         tlh, nlh = tf.size * 1.3, nf.size * 1.38
         c.rect(M, y + 2, 36, 36, 9, P.card, P.ink, 3)
         if t.done:
@@ -610,7 +622,7 @@ def notebook(c, day: Day, lang: str) -> float:
         if t.priority == "high":
             c.text(tx + text_w(tl[-1], tf) + 16, y - 6 + (len(tl) - 1) * tlh, "!", F("Caveat", 44, 700), P.accent)
         if nl:
-            c.lines(tx, y - 2 + len(tl) * tlh + 2, nl, nf, P.muted, nlh)
+            c.lines(tx, y - 2 + len(tl) * tlh + 2, nl, nf, _nc(t, P.muted, P.accent), nlh)
         if t.start is not None:
             c.text(R, y - 6, _short_time(t.start), timef, P.accent, anchor="ra")
             if t.end is not None:
@@ -680,7 +692,7 @@ def sunrise(c, day: Day, lang: str) -> float:
     tw = W - M - 30 - bx
     for t in day.tasks:
         tl = wrap(t.title, tf, tw, 3 if d < 2 else 2)
-        nl = wrap(t.note, nf, tw, 2 if d < 2 else 1) if t.note and d < 3 else []
+        nl = wrap(_note(t, lang, d), nf, tw, 2 if d < 2 else 1) if _note(t, lang, d) else []
         lab = d < 3
         tlh, nlh = tf.size * 1.25, nf.size * 1.38
         h = 2 * pad + (28 if lab else 0) + len(tl) * tlh + (len(nl) * nlh + 4 if nl else 0)
@@ -707,7 +719,7 @@ def sunrise(c, day: Day, lang: str) -> float:
             iy += 28
         c.lines(bx, iy - 2, tl, tf, P.ink, tlh)
         if nl:
-            c.lines(bx, iy - 2 + len(tl) * tlh + 4, nl, nf, P.muted, nlh)
+            c.lines(bx, iy - 2 + len(tl) * tlh + 4, nl, nf, _nc(t, P.muted, "#D9542B"), nlh)
         y += h + gap
 
     fy = max(y + 30, c.h - 86)

@@ -35,7 +35,8 @@ Rules:
   that fits around the other tasks. Otherwise, if nothing about time is said, start and end are null.
   Never invent overlapping times.
 - Use the known context below (work hours, routines) to place tasks sensibly, but never add tasks the user did not mention,
-  except the carried-over tasks listed below.
+  except the carried-over tasks listed below and daily habits (context category "habit") — include each habit once
+  at its usual time unless the user says otherwise.
 - priority: high = urgent, deadline, explicitly important, or serves a long-term goal; low = optional/nice-to-have;
   otherwise medium. Usually at most 1-3 high tasks.
 - category: one of: {CATEGORIES}.
@@ -78,3 +79,46 @@ def report_system(lang: str) -> str:
     return f"""You are a supportive but honest productivity coach. Given someone's task completion data for a period,
 write 2-3 short sentences in {LANG_NAMES.get(lang, 'English')}: one concrete pattern you notice (time of day, categories,
 priorities) and one specific, practical suggestion for next period. No emoji, no greetings, no lists, under 280 characters."""
+
+
+def router_system(lang: str, now: str, today_plan: str, tomorrow_plan: str, memory: str) -> str:
+    return f"""You route messages for a Telegram planning assistant. Decide what the user wants and respond with JSON only:
+
+{{"intent": "plan|add|edit|done|remind|habit|goal|chat",
+  "date": "YYYY-MM-DD or null (the day the message is about)",
+  "task_ids": [ids of existing tasks, for done],
+  "remind_at": "YYYY-MM-DD HH:MM or null (local time, for remind)",
+  "remind_text": "what to remind about, short, for remind",
+  "memory": {{"key": "snake_case", "value": "...", "category": "habit|goal"}} or null,
+  "reply": "short friendly answer in {LANG_NAMES.get(lang, 'English')} (always fill it)"}}
+
+Now (user's local time): {now}.
+Intents:
+- plan: the user lists things to do on a day that has NO plan yet (default day: tomorrow, or today if they say so).
+- add: the user wants to add one or more tasks to a day that ALREADY has a plan below ("also add…", "qo'sh…", or just new items for that day).
+- edit: change, move, rename, reprioritize or delete existing tasks.
+- done: the user reports finishing tasks ("gym done", "sportni qildim") → task_ids from the plans below.
+- remind: a one-off reminder at a specific time that is not part of a day plan ("remind me at 15:30 to call mom", "20 daqiqadan keyin eslat").
+  Compute remind_at as an absolute local datetime.
+- habit: something to do regularly/every day ("every day at 7 run", "har kuni"). Fill memory with category habit; value includes the time.
+- goal: a long-term goal ("I want IELTS 7.5 by June"). Fill memory with category goal.
+- chat: greetings, questions, advice, anything else. Answer helpfully in reply, using the plans and context below when relevant.
+  Keep replies under 600 characters, no markdown headers.
+For plan/add/edit/done/remind/habit/goal the reply is a one-line confirmation.
+
+Today's plan (id: time title [done]):
+{today_plan or "none"}
+
+Tomorrow's plan:
+{tomorrow_plan or "none"}
+
+Known context:
+{memory or "nothing yet"}"""
+
+
+def add_system(lang: str) -> str:
+    return f"""The user wants to add tasks to an existing day plan. Return JSON only with ONLY the new tasks:
+{{"tasks": [{{"title": "max 60 chars", "start": "HH:MM or null", "end": "HH:MM or null",
+  "priority": "high|medium|low", "category": "one of: {CATEGORIES}", "note": "short or empty"}}]}}
+Write in {LANG_NAMES.get(lang, 'English')}. Do not repeat tasks that already exist. Fit times around existing tasks
+without overlaps unless the user gives an explicit time. No emoji."""

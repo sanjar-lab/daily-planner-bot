@@ -39,6 +39,7 @@ class Task:
     category: str = "other"
     note: str = ""
     done: bool = False
+    added: bool = False
 
     @property
     def minutes(self) -> int | None:
@@ -111,10 +112,10 @@ def build_day(plan: dict) -> Day:
             continue
         pr = str(t.get("priority", "medium")).lower()
         tasks.append(Task(
-            idx=i, title=title, start=to_min(t.get("start")), end=to_min(t.get("end")),
+            idx=int(t.get("idx", i)), title=title, start=to_min(t.get("start")), end=to_min(t.get("end")),
             priority=pr if pr in PRIORITIES else "medium",
             category=str(t.get("category") or "other").lower(),
-            note=clean(t.get("note")), done=bool(t.get("done")),
+            note=clean(t.get("note")), done=bool(t.get("done")), added=bool(t.get("added")),
         ))
     timed = sorted((t for t in tasks if t.start is not None), key=lambda t: t.start)
     untimed = [t for t in tasks if t.start is None]

@@ -59,18 +59,32 @@ async def run_jobs(bot: Bot):
     for job in await db.take_due_jobs():
         if now - job["run_at"] > STALE:
             continue
-        plan = await db.get_plan(job["plan_id"])
         user = await db.get_user(job["user_id"])
-        if not plan or plan["status"] != "posted" or not user:
+        if not user:
+            continue
+        lang = user["lang"]
+        if job["kind"] == "custom":
+            await _send(bot.send_message(user["id"], t(lang, "custom_remind", text=html.escape(job["text"] or ""))))
+            continue
+        if job["kind"] == "focus":
+            m = job["text"] or "25"
+            await _send(bot.send_message(user["id"], t(lang, "focus_done", m=m), reply_markup=InlineKeyboardMarkup(
+                inline_keyboard=[[InlineKeyboardButton(text=t(lang, "btn_focus_again", m=m), callback_data=f"fo:{m}")]])))
+            continue
+        plan = await db.get_plan(job["plan_id"]) if job["plan_id"] else None
+        if not plan or plan["status"] != "posted":
             continue
         task = next((tk for tk in plan["data"]["tasks"] if tk["idx"] == job["task_idx"]), None)
         if not task:
             continue
-        lang = user["lang"]
         title = html.escape(task["title"])
         if job["kind"] == "remind":
+            ref = f"{plan['id']}:{task['idx']}"
+            buttons = InlineKeyboardMarkup(inline_keyboard=[[
+                InlineKeyboardButton(text=t(lang, "btn_done"), callback_data=f"rk:{ref}"),
+                InlineKeyboardButton(text=t(lang, "btn_snooze"), callback_data=f"sn:{ref}")]])
             await _send(bot.send_message(user["id"], t(lang, "remind", min=user["remind_before"], title=title,
-                                                       time=task.get("start") or "")))
+                                                       time=task.get("start") or ""), reply_markup=buttons))
         elif job["kind"] == "task_card":
             done = {r["idx"]: r["done"] for r in await db.plan_tasks(plan["id"])}
             if done.get(task["idx"]):
@@ -138,10 +152,10 @@ async def evening(bot: Bot, user, today: dt.date):
                 lang, "evening", done=done, n=n, pct=round(100 * done / n) if n else 0,
                 left=t(lang, "left", items=items) if left else "")))
         if not tomorrow_plan and user["evening_post"]:
-            markup = None
+            rows = [[InlineKeyboardButton(text=t(lang, "btn_repeat"), callback_data="repeat")]]
             if left:
-                markup = InlineKeyboardMarkup(inline_keyboard=[[InlineKeyboardButton(
-                    text=t(lang, "btn_carry"), callback_data="carry")]])
+                rows.insert(0, [InlineKeyboardButton(text=t(lang, "btn_carry"), callback_data="carry")])
+            markup = InlineKeyboardMarkup(inline_keyboard=rows)
             await _send(bot.send_message(user["id"], t(lang, "evening_dm", done=done, n=n), reply_markup=markup))
     elif not tomorrow_plan and user["evening_post"]:
         await _send(bot.send_message(user["id"], t(lang, "ask_plan")))

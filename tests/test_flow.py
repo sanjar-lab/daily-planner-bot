@@ -96,10 +96,28 @@ async def main():
         return key.startswith("good")
     ai_mod_validate = fake_validate
 
-    tomorrow = (dt.datetime.now(dt.timezone.utc) + dt.timedelta(days=1)).date().isoformat()
+    from zoneinfo import ZoneInfo
+    local_now = dt.datetime.now(ZoneInfo("Asia/Tashkent"))
+    tomorrow = (local_now + dt.timedelta(days=1)).date().isoformat()
 
     async def fake_json(self, system, user, tier="smart"):
         self.used = "fake/model"
+        if "You route messages" in system:
+            tl = user.lower()
+            if "remind" in tl:
+                at = (local_now + dt.timedelta(hours=2)).strftime("%Y-%m-%d %H:%M")
+                return {"intent": "remind", "remind_at": at, "remind_text": "call mom", "reply": "ok"}
+            if "done" in tl:
+                return {"intent": "done", "date": tomorrow, "task_ids": [2], "reply": "ok"}
+            if tl.startswith("add"):
+                return {"intent": "add", "date": tomorrow, "reply": "ok"}
+            if "every day" in tl:
+                return {"intent": "habit", "memory": {"key": "run", "value": "Run at 07:00", "category": "habit"}}
+            if "hello" in tl:
+                return {"intent": "chat", "reply": "Hi! <b>ready</b>"}
+            return {"intent": "plan", "date": tomorrow, "reply": "ok"}
+        if "add tasks to an existing day plan" in system:
+            return {"tasks": [{"title": "Read book", "start": "21:00", "end": "21:30"}, {"title": "Gym"}]}
         if "Current plan JSON" in user:
             return {"date": tomorrow, "headline": "Edited", "tasks": [{"title": "Only task", "start": "10:00"}]}
         if "durable facts" in system and "day plan" not in system:
@@ -172,8 +190,11 @@ async def main():
     await feed(message=msg("drop everything except one task at 10"))
     assert "1 tasks" in last("SendPhoto")["caption"]
     await feed(message=msg("tomorrow gym at 7, deploy bot 10-12 important, milk"))
+    assert buttons(last("SendMessage"))[1] == "pa:replace:0"  # a draft exists: add or replace?
+    await feed(callback_query=cb("pa:replace:0"))
     pid = int(buttons(last("SendPhoto"))[0].split(":")[2])
     await feed(callback_query=cb(f"p:post:{pid}"))
+    assert last("SendMessage")["reply_markup"].get("is_persistent") is True  # menu is back
     post = [d for n, d in calls if n == "SendPhoto" and d["chat_id"] == CH][-1]
     assert buttons(post) == [f"t:{pid}:0", f"t:{pid}:1", f"t:{pid}:2"]
     assert "0/3" in post["caption"]
@@ -203,10 +224,60 @@ async def main():
     await scheduler.evening(bot, u, day)
     wrap = [d for n, d in calls if n == "SendMessage" and d["chat_id"] == CH][-1]
     assert "1/3" in wrap["text"] and "Gym" in wrap["text"], wrap
-    assert last("SendMessage")["chat_id"] == UID and buttons(last("SendMessage")) == ["carry"]
+    assert last("SendMessage")["chat_id"] == UID and buttons(last("SendMessage")) == ["carry", "repeat"]
     await feed(callback_query=cb("carry"))
     await scheduler.send_report(bot, u, "month")
     assert "Monthly report" in last("SendPhoto")["caption"]
+
+    # chat mode: add to the posted plan → channel post edited in place, new task marked
+    await feed(message=msg("add reading at 21:00"))
+    media = last("EditMessageMedia")
+    assert media["chat_id"] == CH and f"t:{pid}:3" in buttons(media)
+    assert any("🆕" in b["text"] for row in media["reply_markup"]["inline_keyboard"] for b in row)
+    assert "Added 1 tasks" in last("SendPhoto")["caption"]  # "Gym" was a duplicate and skipped
+    assert (await db.get_plan(pid))["data"]["tasks"][2]["added"] is True
+    # done by chat, keeps earlier ticks
+    await feed(message=msg("milk done"))
+    assert "Buy milk" in last("EditMessageText")["text"]
+    done = {r["idx"]: r["done"] for r in await db.plan_tasks(pid)}
+    assert done[1] and done[2] and not done[3], done
+    # one-off reminder → due → DM
+    await feed(message=msg("remind me in 2 hours to call mom"))
+    assert "call mom" in last("EditMessageText")["text"]
+    await db.pool.execute("update jobs set run_at = now() - interval '1 minute' where user_id = $1 and kind = 'custom'", UID)
+    await scheduler.run_jobs(bot)
+    assert "Reminder" in last("SendMessage")["text"] and "call mom" in last("SendMessage")["text"]
+    # task reminder has Done / Snooze buttons; snooze creates a new custom job
+    await db.pool.execute("update jobs set run_at = now() - interval '1 minute', done = false "
+                          "where plan_id = $1 and kind = 'remind' and task_idx = 3", pid)
+    await scheduler.run_jobs(bot)
+    assert buttons(last("SendMessage")) == [f"rk:{pid}:3", f"sn:{pid}:3"]
+    await feed(callback_query=cb(f"sn:{pid}:3"))
+    assert len(await db.pending_reminders(UID)) == 1
+    await feed(callback_query=cb(f"rk:{pid}:3"))
+    assert {r["idx"]: r["done"] for r in await db.plan_tasks(pid)}[3]
+    # chat reply is escaped; habit is stored
+    await feed(message=msg("hello"))
+    assert last("EditMessageText")["text"] == "Hi! &lt;b&gt;ready&lt;/b&gt;"
+    await feed(message=msg("every day run at 7"))
+    assert any(m["category"] == "habit" for m in await db.get_memory(UID))
+
+    # persistent menu buttons
+    await feed(message=msg("🌅 Tomorrow"))
+    assert last("SendPhoto")["chat_id"] == UID and f"t:{pid}:0" in buttons(last("SendPhoto"))
+    await feed(message=msg("🎯 Goals & habits"))
+    assert "Run at 07:00" in last("SendMessage")["text"]
+    await feed(message=msg("⏰ Reminders"))
+    assert "rd:" in "".join(buttons(last("SendMessage")))
+    await feed(message=msg("🍅 Focus"))
+    await feed(callback_query=cb("fo:25"))
+    assert "25" in last("SendMessage")["text"]
+    await db.pool.execute("update jobs set run_at = now() - interval '1 minute' where user_id = $1 and kind = 'focus'", UID)
+    await scheduler.run_jobs(bot)
+    assert "Focus done" in last("SendMessage")["text"] and buttons(last("SendMessage")) == ["fo:25"]
+    for label in ("📝 Plan", "📅 Today", "📊 Report", "⚙️ Settings"):
+        await feed(message=msg(label))
+    await feed(callback_query=cb("repeat"))
 
     # other commands don't crash
     for cmd in ("/settings", "/keys", "/memory", "/report", "/help", "/today", "/cancel"):

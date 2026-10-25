@@ -28,7 +28,7 @@ WORDS = {
         "now": "Hozir", "next": "Keyingi", "of": "dan", "last": "Kunning oxirgi vazifasi",
         "weekly": "Haftalik hisobot", "monthly": "Oylik hisobot", "done": "Bajarildi",
         "completion": "Bajarilish", "best_day": "Eng yaxshi kun", "streak": "Ketma-ket kunlar",
-        "high_done": "Muhimlar", "days": "kun", "plan_of_day": "Kun rejasi", "no_data": "Ma’lumot yo‘q",
+        "high_done": "Muhimlar", "days": "kun", "plan_of_day": "Kun rejasi", "added": "Qo‘shildi", "no_data": "Ma’lumot yo‘q",
         "h": "s", "m": "daq",
     },
     "ru": {
@@ -39,7 +39,7 @@ WORDS = {
         "now": "Сейчас", "next": "Далее", "of": "из", "last": "Последняя задача дня",
         "weekly": "Отчёт за неделю", "monthly": "Отчёт за месяц", "done": "Выполнено",
         "completion": "Выполнение", "best_day": "Лучший день", "streak": "Дней подряд",
-        "high_done": "Важные", "days": "дн.", "plan_of_day": "План дня", "no_data": "Нет данных",
+        "high_done": "Важные", "days": "дн.", "plan_of_day": "План дня", "added": "Добавлено", "no_data": "Нет данных",
         "h": "ч", "m": "мин",
     },
     "en": {
@@ -50,7 +50,7 @@ WORDS = {
         "now": "Now", "next": "Next", "of": "of", "last": "Last task of the day",
         "weekly": "Weekly report", "monthly": "Monthly report", "done": "Done",
         "completion": "Completion", "best_day": "Best day", "streak": "Day streak",
-        "high_done": "High priority", "days": "days", "plan_of_day": "Plan of the day", "no_data": "No data",
+        "high_done": "High priority", "days": "days", "plan_of_day": "Plan of the day", "added": "Added", "no_data": "No data",
         "h": "h", "m": "m",
     },
 }
