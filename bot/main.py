@@ -68,7 +68,9 @@ def run_webhook():
     async def tick(req: web.Request):
         # cron-job.org hits this every few minutes: keeps the free instance awake
         # and runs due work even if the in-process loop was frozen while asleep.
-        if config.TICK_KEY and not hmac.compare_digest(req.query.get("key", ""), config.TICK_KEY):
+        # an unencoded "+" in the key (Render's generated values are base64) arrives as a space
+        key = req.query.get("key", "").replace(" ", "+")
+        if config.TICK_KEY and not hmac.compare_digest(key, config.TICK_KEY):
             return web.Response(status=403)
         await scheduler.tick(bot)
         return web.Response(text="ticked")
